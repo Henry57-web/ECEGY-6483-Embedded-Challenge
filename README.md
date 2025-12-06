@@ -1,1 +1,1 @@
-# ECEGY-6483-Embeded-Challenge
+# ECEGY-6483-Embedded-Challenge
