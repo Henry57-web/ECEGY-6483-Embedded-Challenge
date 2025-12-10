@@ -2,6 +2,21 @@
 #include <Wire.h>
 #include <arduinoFFT.h>
 #include <math.h>
+#include <SPI.h>
+#include <SPBTLE_RF.h>
+
+// -----------------------------
+// BLE Configuration
+// -----------------------------
+SPBTLERFClass SPBTLE_RF(SPI, 7, 0, 1, 8, 6); // Using default pins for B-L475E-IOT01A
+
+// BLE Service and Characteristics UUIDs
+#define PARKINSON_SERVICE_UUID    "19B10000-E8F2-537E-4F6C-D104768A1214"
+#define TREMOR_CHAR_UUID          "19B10001-E8F2-537E-4F6C-D104768A1214"
+#define DYSKINESIA_CHAR_UUID      "19B10002-E8F2-537E-4F6C-D104768A1214"
+#define FOG_CHAR_UUID             "19B10003-E8F2-537E-4F6C-D104768A1214"
+
+bool bleConnected = false;
 
 // -----------------------------
 // I2C2 for LSM6DSL
@@ -136,6 +151,7 @@ int argmax(int f1, int f2)
 
   for (int k = k1; k <= k2; k++)
   {
+    
     if (mag[k] > val)
     {
       val = mag[k];
@@ -193,6 +209,85 @@ void flashLED(int ledPin, int delayMs)
 }
 
 // -----------------------------
+// BLE Initialization
+// -----------------------------
+void initBLE()
+{
+  Serial.println("Initializing BLE...");
+  
+  // Initialize BLE module
+  if (SPBTLE_RF.begin() == false)
+  {
+    Serial.println("BLE initialization failed!");
+    return;
+  }
+  
+  Serial.println("BLE initialized successfully");
+  
+  // Set device name
+  SPBTLE_RF.setName("ParkinsonMonitor");
+  
+  // Add Parkinson's monitoring service
+  SPBTLE_RF.addService(PARKINSON_SERVICE_UUID);
+  
+  // Add characteristics
+  SPBTLE_RF.addCharacteristic(PARKINSON_SERVICE_UUID, TREMOR_CHAR_UUID, 1, 1, 0x12); // Read + Notify
+  SPBTLE_RF.addCharacteristic(PARKINSON_SERVICE_UUID, DYSKINESIA_CHAR_UUID, 1, 1, 0x12); // Read + Notify
+  SPBTLE_RF.addCharacteristic(PARKINSON_SERVICE_UUID, FOG_CHAR_UUID, 1, 1, 0x12); // Read + Notify
+  
+  Serial.println("BLE service and characteristics added");
+  
+  // Start advertising
+  SPBTLE_RF.advertise();
+  Serial.println("BLE advertising started - Device: ParkinsonMonitor");
+}
+
+// -----------------------------
+// Send BLE Data
+// -----------------------------
+void sendBLEData(uint8_t tremorLevel, uint8_t dyskLevel, uint8_t fogStatus)
+{
+  if (!bleConnected)
+  {
+    // Check for new connections
+    bleConnected = SPBTLE_RF.connected();
+    if (bleConnected)
+    {
+      Serial.println("BLE device connected!");
+    }
+  }
+  
+  if (bleConnected)
+  {
+    // Update characteristics
+    SPBTLE_RF.updateCharacteristic(PARKINSON_SERVICE_UUID, TREMOR_CHAR_UUID, &tremorLevel, 1);
+    SPBTLE_RF.updateCharacteristic(PARKINSON_SERVICE_UUID, DYSKINESIA_CHAR_UUID, &dyskLevel, 1);
+    SPBTLE_RF.updateCharacteristic(PARKINSON_SERVICE_UUID, FOG_CHAR_UUID, &fogStatus, 1);
+    
+    Serial.print("BLE Data sent - Tremor:");
+    Serial.print(tremorLevel);
+    Serial.print(" Dysk:");
+    Serial.print(dyskLevel);
+    Serial.print(" FOG:");
+    Serial.println(fogStatus);
+  }
+}
+
+// -----------------------------
+// Map magnitude to intensity level (0-100)
+// -----------------------------
+uint8_t mapIntensity(float magnitude, float minMag, float maxMag)
+{
+  if (magnitude <= minMag)
+    return 0;
+  if (magnitude >= maxMag)
+    return 100;
+  
+  float ratio = (magnitude - minMag) / (maxMag - minMag);
+  return (uint8_t)(ratio * 100.0f);
+}
+
+// -----------------------------
 // Setup
 // -----------------------------
 void setup()
@@ -205,6 +300,10 @@ void setup()
   pinMode(LED_TREMOR, OUTPUT);
   pinMode(LED_DYSK, OUTPUT);
   pinMode(LED_FOG, OUTPUT);
+
+  // Initialize BLE
+  initBLE();
+  delay(500);
 
   Wire2.begin();
   Wire2.setClock(400000);
@@ -298,6 +397,33 @@ void loop()
       }
 
       // -----------------------------
+      // Calculate intensity levels for BLE
+      // -----------------------------
+      uint8_t tremorIntensity = 0;
+      uint8_t dyskIntensity = 0;
+      uint8_t fogStatus = 0;
+
+      if (trem)
+      {
+        tremorIntensity = mapIntensity(mt, 25.0f, 60.0f);
+      }
+      
+      if (dysk)
+      {
+        dyskIntensity = mapIntensity(md, 25.0f, 60.0f);
+      }
+      
+      if (fog)
+      {
+        fogStatus = 100; // Binary: 100 = detected, 0 = not detected
+      }
+
+      // -----------------------------
+      // Send BLE Data
+      // -----------------------------
+      sendBLEData(tremorIntensity, dyskIntensity, fogStatus);
+
+      // -----------------------------
       // LED Output
       // -----------------------------
       if (fog)
@@ -339,6 +465,8 @@ void loop()
       else
       {
         Serial.println(">> No abnormal motion");
+        // Send zeros when no condition detected
+        sendBLEData(0, 0, 0);
       }
 
       previousVar = variance;
