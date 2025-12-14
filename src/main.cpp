@@ -2,33 +2,35 @@
 #include <Wire.h>
 #include <arduinoFFT.h>
 #include <math.h>
+#include <STM32duinoBLE.h> // STM32 BLE library
 
 // -----------------------------
-// I2C2 for LSM6DSL
+// I2C2 for LSM6DSL IMU
 // -----------------------------
 TwoWire Wire2(PB11, PB10); // SDA = PB11, SCL = PB10
 
 #define LSM6DSL_ADDR 0x6A
 #define REG_CTRL1_XL 0x10
+#define REG_CTRL2_G 0x11
 #define REG_OUTX_L_XL 0x28
+#define REG_OUTX_L_G 0x22
 #define REG_WHOAMI 0x0F
 
 // -----------------------------
 // LED pins
 // -----------------------------
 #define LED_TREMOR LED1
-#define LED_DYSK LED2
+#define LED_DYSK LED2 // Also used as BLE connection indicator
 #define LED_FOG LED3
 
 // -----------------------------
-// FFT settings
+// FFT configuration
 // -----------------------------
 constexpr int SAMPLE_RATE = 342;
 constexpr int BUF_LEN = 1024;
 
 float buf[BUF_LEN];
 float mag[BUF_LEN / 2];
-
 double vReal[BUF_LEN];
 double vImag[BUF_LEN];
 
@@ -37,18 +39,56 @@ ArduinoFFT<double> FFT(vReal, vImag, BUF_LEN, SAMPLE_RATE);
 int idx = 0;
 
 // -----------------------------
+// Gyroscope data buffers
+// -----------------------------
+float gyroBuf[BUF_LEN]; // Store gyro magnitude for gait analysis
+
+// -----------------------------
+// Step detection variables
+// -----------------------------
+int stepCount = 0;
+unsigned long lastStepTime = 0;
+unsigned long walkingStartTime = 0;
+bool isWalking = false;
+float cadence = 0.0f; // steps per minute
+
+#define STEP_THRESHOLD 150.0f // deg/s threshold for step detection
+#define STEP_MIN_INTERVAL 300 // minimum 300ms between steps
+#define WALKING_TIMEOUT 2000  // 2 seconds without steps = stopped walking
+
+// -----------------------------
 // FOG detection parameters
 // -----------------------------
 float previousVar = 0.0;
 bool wasMoving = false;
 
-#define MOVEMENT_VAR_THR 0.0008f // Variance threshold for movement detection
-#define STILL_VAR_THR 0.00015f   // Variance threshold for stillness detection
+#define MOVEMENT_VAR_THR 0.0008f // Variance threshold for detecting movement
+#define STILL_VAR_THR 0.00015f   // Variance threshold for detecting stillness
 #define VAR_DROP_RATIO 0.6f      // Required variance drop ratio for FOG
 #define FOG_ENERGY_THR 8.0f      // Energy threshold for 1–3 Hz band
 
+// =====================================================
+// BLE Configuration: 1 Service + 3 Characteristics (0/1)
+// =====================================================
+#define PD_SERVICE_UUID "19B10000-E8F2-537E-4F6C-D104768A1214"
+#define TREMOR_CHAR_UUID "19B10001-E8F2-537E-4F6C-D104768A1214"
+#define DYSK_CHAR_UUID "19B10002-E8F2-537E-4F6C-D104768A1214"
+#define FOG_CHAR_UUID "19B10003-E8F2-537E-4F6C-D104768A1214"
+
+BLEService pdService(PD_SERVICE_UUID);
+
+// Detection outputs: 0 = not detected, 1 = detected
+BLEUnsignedCharCharacteristic tremorChar(
+    TREMOR_CHAR_UUID, BLERead | BLENotify);
+BLEUnsignedCharCharacteristic dyskChar(
+    DYSK_CHAR_UUID, BLERead | BLENotify);
+BLEUnsignedCharCharacteristic fogChar(
+    FOG_CHAR_UUID, BLERead | BLENotify);
+
+bool bleConnected = false;
+
 // -----------------------------
-// Read multiple registers
+// Read multiple registers from IMU
 // -----------------------------
 bool readRegisters(uint8_t reg, uint8_t *buf, int len)
 {
@@ -68,7 +108,7 @@ bool readRegisters(uint8_t reg, uint8_t *buf, int len)
 }
 
 // -----------------------------
-// Write single register
+// Write a single IMU register
 // -----------------------------
 bool writeRegister(uint8_t reg, uint8_t val)
 {
@@ -98,17 +138,15 @@ float computeVariance(float *data, int len)
 }
 
 // -----------------------------
-// FFT with DC offset removal
+// Execute FFT with DC offset removal
 // -----------------------------
 void computeFFT()
 {
-  // Compute mean for DC removal
   double mean = 0;
   for (int i = 0; i < BUF_LEN; i++)
     mean += buf[i];
   mean /= BUF_LEN;
 
-  // Remove DC component
   for (int i = 0; i < BUF_LEN; i++)
   {
     vReal[i] = buf[i] - mean;
@@ -124,7 +162,7 @@ void computeFFT()
 }
 
 // -----------------------------
-// Find max magnitude index in frequency band
+// Find maximum magnitude in a frequency band
 // -----------------------------
 int argmax(int f1, int f2)
 {
@@ -146,7 +184,7 @@ int argmax(int f1, int f2)
 }
 
 // -----------------------------
-// Map frequency to blink delay
+// Map detected frequency to LED blink delay
 // -----------------------------
 int mapBlink(int f, int fmin, int fmax)
 {
@@ -158,12 +196,12 @@ int mapBlink(int f, int fmin, int fmax)
   if (f >= fmax)
     return minD;
 
-  float r = (float)(f - fmin) / (float)(fmax - fmin);
+  float r = float(f - fmin) / float(fmax - fmin);
   return maxD - r * (maxD - minD);
 }
 
 // -----------------------------
-// Compute energy in frequency band
+// Compute energy of frequency band
 // -----------------------------
 float computeBandEnergy(int f1, int f2)
 {
@@ -178,7 +216,7 @@ float computeBandEnergy(int f1, int f2)
 }
 
 // -----------------------------
-// Flash LED with given delay
+// Flash LED for visual alert
 // -----------------------------
 void flashLED(int ledPin, int delayMs)
 {
@@ -189,6 +227,20 @@ void flashLED(int ledPin, int delayMs)
     delay(delayMs);
     digitalWrite(ledPin, LOW);
     delay(delayMs);
+  }
+}
+
+// -----------------------------
+// Blink LED_DYSK on BLE connect/disconnect
+// -----------------------------
+void blinkBLEStatus()
+{
+  for (int i = 0; i < 3; i++)
+  {
+    digitalWrite(LED_DYSK, HIGH);
+    delay(120);
+    digitalWrite(LED_DYSK, LOW);
+    delay(120);
   }
 }
 
@@ -206,36 +258,163 @@ void setup()
   pinMode(LED_DYSK, OUTPUT);
   pinMode(LED_FOG, OUTPUT);
 
+  digitalWrite(LED_TREMOR, LOW);
+  digitalWrite(LED_DYSK, LOW);
+  digitalWrite(LED_FOG, LOW);
+
+  // Initialize I2C and IMU
   Wire2.begin();
   Wire2.setClock(400000);
 
-  writeRegister(REG_CTRL1_XL, 0x60);
+  writeRegister(REG_CTRL1_XL, 0x60); // 416 Hz, ±2g
+  writeRegister(REG_CTRL2_G, 0x60);  // 416 Hz, ±500 dps gyro
   delay(10);
 
   uint8_t id = 0;
   readRegisters(REG_WHOAMI, &id, 1);
   Serial.print("WHO_AM_I = 0x");
   Serial.println(id, HEX);
+
+  // -----------------------------
+  // BLE initialization
+  // -----------------------------
+  Serial.println("Initializing BLE...");
+  if (!BLE.begin())
+  {
+    Serial.println("BLE init failed.");
+  }
+  else
+  {
+    BLE.setLocalName("PD_Monitor");
+    BLE.setDeviceName("PD_Monitor");
+    BLE.setAdvertisedService(pdService);
+
+    // Human-readable characteristic labels
+    BLEDescriptor tremDesc("2901", "Tremor Status");
+    BLEDescriptor dyskDesc("2901", "Dyskinesia Status");
+    BLEDescriptor fogDesc("2901", "FOG Status");
+
+    tremorChar.addDescriptor(tremDesc);
+    dyskChar.addDescriptor(dyskDesc);
+    fogChar.addDescriptor(fogDesc);
+
+    pdService.addCharacteristic(tremorChar);
+    pdService.addCharacteristic(dyskChar);
+    pdService.addCharacteristic(fogChar);
+    BLE.addService(pdService);
+
+    tremorChar.writeValue((uint8_t)0);
+    dyskChar.writeValue((uint8_t)0);
+    fogChar.writeValue((uint8_t)0);
+
+    BLE.advertise();
+    Serial.println("BLE advertising as \"PD_Monitor\"");
+  }
 }
 
 // -----------------------------
-// Loop
+// Main Loop
 // -----------------------------
 void loop()
 {
-  uint8_t raw[6];
+  BLE.poll();
 
-  if (readRegisters(REG_OUTX_L_XL, raw, 6))
+  // BLE connect / disconnect handling
+  static bool prevConnected = false;
+  BLEDevice central = BLE.central();
+
+  if (central && !prevConnected)
   {
-    int16_t ax = (raw[1] << 8) | raw[0];
-    int16_t ay = (raw[3] << 8) | raw[2];
-    int16_t az = (raw[5] << 8) | raw[4];
+    prevConnected = true;
+    bleConnected = true;
+    Serial.print("[BLE] Connected: ");
+    Serial.println(central.address());
+    blinkBLEStatus();
+  }
+  else if (!central && prevConnected)
+  {
+    prevConnected = false;
+    bleConnected = false;
+    Serial.println("[BLE] Disconnected");
+    blinkBLEStatus();
+  }
 
-    float g = sqrtf(ax * ax + ay * ay + az * az) * (2.0f / 32768.0f);
+  // -----------------------------
+  // Sensor sampling + FFT pipeline
+  // -----------------------------
+  uint8_t rawAccel[6];
+  uint8_t rawGyro[6];
+
+  if (readRegisters(REG_OUTX_L_XL, rawAccel, 6) && 
+      readRegisters(REG_OUTX_L_G, rawGyro, 6))
+  {
+    // Read accelerometer
+    int16_t ax = (rawAccel[1] << 8) | rawAccel[0];
+    int16_t ay = (rawAccel[3] << 8) | rawAccel[2];
+    int16_t az = (rawAccel[5] << 8) | rawAccel[4];
+
+    float g = sqrtf(ax * ax + ay * ay + az * az) *
+              (2.0f / 32768.0f);
+
     if (!isfinite(g))
       g = 0;
 
-    buf[idx++] = g;
+    // Read gyroscope
+    int16_t gx = (rawGyro[1] << 8) | rawGyro[0];
+    int16_t gy = (rawGyro[3] << 8) | rawGyro[2];
+    int16_t gz = (rawGyro[5] << 8) | rawGyro[4];
+
+    float gyroMag = sqrtf(gx * gx + gy * gy + gz * gz) *
+                    (500.0f / 32768.0f); // Convert to deg/s
+
+    if (!isfinite(gyroMag))
+      gyroMag = 0;
+
+    // Step detection using gyroscope
+    unsigned long currentTime = millis();
+    if (gyroMag > STEP_THRESHOLD && 
+        (currentTime - lastStepTime) > STEP_MIN_INTERVAL)
+    {
+      stepCount++;
+      lastStepTime = currentTime;
+      
+      Serial.print("[STEP] Detected! Count=");
+      Serial.print(stepCount);
+      Serial.print(" GyroMag=");
+      Serial.println(gyroMag);
+      
+      if (!isWalking)
+      {
+        isWalking = true;
+        walkingStartTime = currentTime;
+        Serial.println("[GAIT] Walking started");
+      }
+      
+      // Calculate cadence (steps per minute)
+      unsigned long walkingDuration = currentTime - walkingStartTime;
+      if (walkingDuration > 5000) // After 5 seconds of walking
+      {
+        cadence = (stepCount / (walkingDuration / 1000.0f)) * 60.0f;
+      }
+    }
+    
+    // Check if walking stopped
+    if (isWalking && (currentTime - lastStepTime) > WALKING_TIMEOUT)
+    {
+      Serial.print("[GAIT] Walking stopped. Steps: ");
+      Serial.print(stepCount);
+      Serial.print(" Cadence: ");
+      Serial.println(cadence);
+      
+      // Reset step detection
+      stepCount = 0;
+      isWalking = false;
+      cadence = 0.0f;
+    }
+
+    buf[idx] = g;
+    gyroBuf[idx] = gyroMag;
+    idx++;
 
     if (idx >= BUF_LEN)
     {
@@ -246,25 +425,24 @@ void loop()
 
       computeFFT();
 
-      // --- Tremor & Dysk frequency peaks ---
       int kt = argmax(3, 5);
       int kd = argmax(5, 7);
 
-      float ft = (float)kt * SAMPLE_RATE / BUF_LEN;
-      float fd = (float)kd * SAMPLE_RATE / BUF_LEN;
+      float ft = float(kt) * SAMPLE_RATE / BUF_LEN;
+      float fd = float(kd) * SAMPLE_RATE / BUF_LEN;
 
       float mt = mag[kt];
       float md = mag[kd];
 
       Serial.print("Tremor F=");
-      Serial.print(ft, 2);
+      Serial.print(ft);
       Serial.print(" Mag=");
-      Serial.println(mt, 2);
+      Serial.println(mt);
 
-      Serial.print("Dysk   F=");
-      Serial.print(fd, 2);
+      Serial.print("Dysk F=");
+      Serial.print(fd);
       Serial.print(" Mag=");
-      Serial.println(md, 2);
+      Serial.println(md);
 
       Serial.print("Var=");
       Serial.print(variance, 6);
@@ -273,47 +451,53 @@ void loop()
       Serial.print(" Moving=");
       Serial.println(isMoving);
 
-      // --- FOG peak in 1–3 Hz band ---
       int fogK = argmax(1, 3);
-      float fogF = (float)fogK * SAMPLE_RATE / BUF_LEN;
+      float fogF = float(fogK) * SAMPLE_RATE / BUF_LEN;
       float fogMag = mag[fogK];
-
-      Serial.print("FOG peak F=");
-      Serial.print(fogF, 2);
-      Serial.print(" Mag=");
-      Serial.println(fogMag, 2);
-
       float fogEnergy = computeBandEnergy(1, 3);
-      Serial.print("FOG Energy=");
-      Serial.println(fogEnergy, 2);
 
-      // --- Simplified FOG rule: movement → sudden stillness ---
+      Serial.print("FOG Peak F=");
+      Serial.print(fogF);
+      Serial.print(" Mag=");
+      Serial.println(fogMag);
+
+      Serial.print("FOG Energy=");
+      Serial.println(fogEnergy);
+
       bool trem = (mt > md && mt > 25.0f);
       bool dysk = (md > 25.0f);
       bool fog = false;
 
+      // Enhanced FOG detection: sudden stop after walking
       if (wasMoving && !isMoving)
+        fog = true;
+      
+      // Additional FOG check: was walking but suddenly frozen
+      if (isWalking && variance < STILL_VAR_THR && stepCount > 3)
       {
-        fog = true; // Trigger FOG when movement stops suddenly
+        fog = true;
+        Serial.println("[FOG] Freezing gait detected during walking!");
       }
 
-      // -----------------------------
-      // LED Output
-      // -----------------------------
+      // Update BLE characteristics
+      tremorChar.writeValue(trem ? 1 : 0);
+      dyskChar.writeValue(dysk ? 1 : 0);
+      fogChar.writeValue(fog ? 1 : 0);
+
+      // LED alerts
       if (fog)
       {
-        Serial.println(">>> FOG detected — LED3 FAST blink");
+        Serial.println(">>> FOG detected — LED3 blinking");
         flashLED(LED_FOG, 80);
       }
       else if (trem)
       {
-        int d = mapBlink((int)ft, 3, 5);
-        Serial.println(">> Tremor detected — LED1 blink");
+        int d = mapBlink(int(ft), 3, 5);
+        Serial.println(">> Tremor detected — LED1 blinking");
         flashLED(LED_TREMOR, d);
       }
       else if (dysk)
       {
-        // Amplitude-controlled blinking for dyskinesia
         float md_min = 10.0f;
         float md_max = 40.0f;
 
@@ -326,12 +510,9 @@ void loop()
         else if (md >= md_max)
           d = minD;
         else
-        {
-          float r = (md - md_min) / (md_max - md_min);
-          d = maxD - r * (maxD - minD);
-        }
+          d = maxD - ((md - md_min) / (md_max - md_min)) * (maxD - minD);
 
-        Serial.print(">> Dysk detected — LED2 blink (Amp-based) delay=");
+        Serial.print(">> Dysk detected — LED2 (amp-based) delay=");
         Serial.println(d);
 
         flashLED(LED_DYSK, d);
@@ -339,6 +520,9 @@ void loop()
       else
       {
         Serial.println(">> No abnormal motion");
+        tremorChar.writeValue(0);
+        dyskChar.writeValue(0);
+        fogChar.writeValue(0);
       }
 
       previousVar = variance;
@@ -347,5 +531,5 @@ void loop()
     }
   }
 
-  delayMicroseconds((int)(1000000.0 / SAMPLE_RATE));
+  delayMicroseconds(int(1e6 / SAMPLE_RATE));
 }
